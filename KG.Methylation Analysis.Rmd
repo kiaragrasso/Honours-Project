@@ -1,0 +1,631 @@
+---
+title: "DEE fibroblast transdifferentiation Methylation Analysis"
+author: "Kiara Grasso, Mark Corbett"
+date: "24/10/2024"
+output:
+  html_document:
+      toc: true
+      code_folding: hide
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(kableExtra)
+```
+
+## Introduction
+The following document is a summary of the analysis methylation array data generated from transdifferentiated fibroblasts from individuals with DEE due to variants in *CHD2* or *SCN2A*.  
+The samples consist of differing numbers of biological replicates of each genotype (WT = 4, *SCN2A* =3 and *CHD2* =2). Genomic DNA was extracted from cultured cells as fibroblasts and at day 10 of transdifferentiation.
+
+## Set up the environment
+The working environment is set up here including the required libraries, metadata, colour schemes and the experimental groups planned for later analyses. 
+
+### Load libraries
+In this section the libraries are selected and loaded with the exception of rgl and kableExtra which are best loaded immediately after the header.
+
+```{r load_libraries}
+library(minfi)
+library(limma)
+library(DMRcate)
+library(DMRcatedata)
+library(maxprobes)  
+library(readxl)
+library(dplyr)
+library(RColorBrewer)
+library(missMethyl)
+library(Gviz)
+library(stringr)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(reshape2)
+library(ggplot2)
+library(plotly)  # For 3D plotting
+
+```
+
+## Load Data
+```{r}
+rg_set <- read.metharray.exp(base = "/Users/kiaragrasso/Desktop/KG_MethylationArray.idat")
+annotation(rg_set)["array"] <- "IlluminaHumanMethylationEPICv2"
+annotation(rg_set)["annotation"] <- "20a1.hg38"
+```
+
+## Read Metadata
+```{r}
+##metadata <- as.data.frame(read.csv("/Users/kiaragrasso/Desktop/Metadata/metadata.csv"))
+```
+
+```{r}
+metadata<-read.table(file="/Users/kiaragrasso/Desktop/Metadata/metadata.2.csv", header=TRUE, sep=",", as.is = FALSE)
+rownames(metadata)<-metadata[,"sampleCode"] # set row names to sample names
+metadata.current<-metadata # sometimes you want to throw out a sample or use a subset.  designating pdata.current allows you to temporarily change this without altering your original pdata table
+samples<-as.character(metadata.current$sampleCode)
+kbl(metadata.current) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+```
+
+
+```{r define_tests}
+# Set up vectors of categories
+
+# Grouped categories
+diffState = factor(paste(metadata.current$diffState))
+genotype = factor(paste(metadata.current$genotype))
+diffVsGeno = factor(paste(metadata.current$diffState, metadata.current$genotype, sep="."))
+sex = factor(paste(metadata.current$sex))
+
+# Define colour palettes for graphing
+# I use the palettes suggested here https://tsitsul.in/blog/coloropt/ but there are many other options
+# e.g. https://medialab.github.io/iwanthue/ or https://www.simplifiedsciencepublishing.com/resources/best-color-palettes-for-scientific-figures-and-data-visualizations
+
+xgfs_normal12 = c("#ebac23", "#b80058", "#008cf9", "#006e00", "#00bbad", "#d163e6", "#b24502", "#ff9287", "#5954d6", "#00c6f8", "#878500", "#00a76c", "#bdbdbd")
+pal4cellType = xgfs_normal12[c(1:length(levels(diffState)))]
+pal4genotype = xgfs_normal12[c(1:length(levels(genotype)))]
+pal4diffVsGeno = xgfs_normal12[c(1:length(levels(diffVsGeno)))]
+pal4Sex = xgfs_normal12[c(6,9)] # It's sterotyped but it works
+blue_col_scale = brewer.pal(4,"Blues")
+pal4RIN = colorRampPalette(blue_col_scale)
+```
+
+## Quality Control
+The following tests check the integrity of the array data.  Check older versions of the minfi vingnette (e.g. https://bioconductor.org/packages/2.14/bioc/vignettes/minfi/inst/doc/minfi.pdf) to get an idea of what each plot does (more recent versions >3.0 don't have complete documentation).
+```{r write_qc_report}
+#qcReport(rg_set, pdf="output/qc/qcReport.pdf", sampGroups=diffVsGeno, sampNames=rg_set$sampleCode)
+```
+
+### Detect p-values
+```{r extract_detection_p-values}
+p_values <- detectionP(rg_set, type = "m+u")
+colnames(p_values) <- metadata$sampleCode
+```
+
+```{r}
+## Check p-values for any failed samples
+#     fill=pal[1:length(levels(factor(rg_set$sampleCode)))], bg="white")
+# }pal <- brewer.pal(8, "Dark2")
+# par(mfrow=c(1, 2))
+# 
+# # First Barplot
+# barplot(colMeans(p_values), 
+#         col=pal[factor(rg_set$sampleCode)], 
+#         las=2, 
+#         cex.names=0.8, 
+#         ylab="Mean detection p-values")
+# abline(h=0.05, col="red")
+# 
+# # Legend for the first Barplot
+# if (length(levels(factor(rg_set$sampleCode))) > 0) {
+#     legend("topleft", legend=levels(factor(rg_set$sampleCode)), 
+#            fill=pal[1:length(levels(factor(rg_set$sampleCode)))], bg="white")
+# }
+# 
+# # Second Barplot
+# barplot(colMeans(p_values), 
+#         col=pal[factor(rg_set$sampleCode)], 
+#         las=2, 
+#         cex.names=0.8, 
+#         ylim=c(0, 0.002), 
+#         ylab="Mean detection p-values")
+# abline(h=0.05, col="red")
+# 
+# # Legend for the second Barplot
+# if (length(levels(factor(rg_set$sampleCode))) > 0) {
+#     legend("topleft", legend=levels(factor(rg_set$sampleCode)), 
+#        
+```
+
+### Check p-values for any failed samples
+```{r plot_detection_p-values}
+data = data.frame("sampleCode" = metadata$sampleCode, "mean_p_value" = colMeans(p_values))
+
+p = ggplot(data, aes(sampleCode, mean_p_value, fill = factor(paste(metadata$diffState, metadata$genotype, sep=".")))) +
+  geom_bar(stat = "identity", lwd = 1) +
+  scale_fill_manual(values = pal4diffVsGeno, name = "Genotype & timepoint") +
+  ylab("Mean detection p-value") +
+  geom_abline(intercept = 0.05, colour = "red") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+p
+```
+
+## Preprocessing
+```{r Noob_preprocess}
+mSet <- preprocessNoob(rg_set)
+colnames(mSet) <- metadata$sampleCode
+```
+
+### Remove low-quality probes by detection p-value
+```{r remove_low_qual}
+keep <- rowSums(p_values<0.01)==ncol(mSet)
+mSet <- mSet[keep,]
+```
+
+### Remove probes with known SNPs
+```{r remove_SNP}
+gmSet <- dropLociWithSnps(mapToGenome(mSet))
+```
+
+### Remove cross reactive probes
+```{r remove_multi-mapping_probes}
+xreactive_probes <- xreactive_probes(array_type="EPIC")
+keep <- !(featureNames(gmSet) %in% xreactive_probes)
+gmSet <- gmSet[keep,]
+```
+
+### Remove probes mapping to sex chromosomes
+```{r remove_sex_chr_probes}
+ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+keep <- !(featureNames(gmSet) %in% ann$Name[ann$chr %in% c("chrX","chrY")])
+gmSet <- gmSet[keep,]
+```
+
+### Get beta and M values
+```{r extract_beta}
+beta_values <- getBeta(gmSet)
+colnames(beta_values) <- metadata$sampleCode
+
+## Alternate approach using DMRcate does all of the above
+
+#beta_values = getBeta(mSet)
+#colnames(beta_values) <- rg_set$sampleCode
+#beta_values = rmSNPandCH(beta_values, dist = 2, mafcut = 0.05, and = TRUE, rmcrosshyb = TRUE, 
+#           rmXY = TRUE)
+
+m_values <- log(beta_values / (1 - beta_values))
+m_values_df <- data.frame(m_values)
+rownames(m_values_df) <- rownames(beta_values)  # Retaining probe names
+colnames(m_values_df) <- colnames(beta_values)  # Retaining sample names
+head(m_values_df)
+
+```
+
+### Plot the distribution of beta and M values
+
+```{r plot_beta_and_m_dist}
+# Set up plotting area: 1 row, 2 columns
+par(mfrow=c(1, 2))
+
+# Density plot for beta values
+densityPlot(beta_values, sampGroups=factor(metadata$sampleCode), main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+#legend("right", legend = levels(factor(metadata$sampleCode)), 
+       #text.col=brewer.pal(8,"Dark2"))
+
+# Density plot for M-values
+alt_m_values = getM(gmSet)
+densityPlot(alt_m_values, sampGroups=factor(metadata$sampleCode), main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("right", legend = levels(factor(rg_set$sampleCode)), 
+      text.col=brewer.pal(8,"Dark2"))
+```
+
+### MDS plots
+These plots show the relationships between samples based on their underlying array data.
+
+```{r create_first_2D_MDS_plot}
+# Create a distance matrix using Euclidean distance
+beta_values_numeric <- as.data.frame(beta_values)
+distance_matrix <- dist(t(beta_values_numeric))
+
+# Perform MDS
+mds_results <- cmdscale(distance_matrix, k = 2)  # k = 2 for 2D plot
+
+# Convert MDS results to a data frame
+mds_data <- as.data.frame(mds_results)
+colnames(mds_data) <- c("MDS1", "MDS2")
+mds_data$sampleCode <- rownames(mds_data)
+
+# Merge MDS results with metadata for coloring
+mds_data <- merge(mds_data, metadata.current, by = "sampleCode")
+
+# Create an MDS plot
+mds_plot <- ggplot(mds_data, aes(x = MDS1, y = MDS2, color = diffState, shape = genotype, label = sampleCode)) +
+  geom_point(size=3) +
+  geom_text(vjust = -1.5, size = 3, check_overlap = TRUE) +  # Add sampleCode labels
+  labs(title = "MDS of Methylation Data",
+       x = "MDS Dimension 1",
+       y = "MDS Dimension 2") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_color_manual(values = pal4cellType) +  # Use the defined color palette
+  guides(shape = guide_legend(title = "Genotype"))
+
+# Print the MDS plot
+print(mds_plot)
+```
+### MDS plots in three dimensions
+```{r MDS_plots_beyond_1_and_2}
+# Prepare a plot layout with 1 row and 3 columns
+par(mfrow=c(1,3))
+
+# First PCA plot
+plotMDS(getM(mSet), top=1000, gene.selection="common", 
+        col=pal4genotype[factor(metadata.current$genotype)], dim=c(1,3))
+legend("topleft", legend=levels(factor(metadata.current$genotype)), 
+       text.col=pal4genotype, cex=0.7, bg="white")
+
+# Second PCA plot
+plotMDS(getM(mSet), top=1000, gene.selection="common", 
+        col=pal4genotype[factor(metadata.current$genotype)], dim=c(2,3))
+legend("topleft", legend=levels(factor(metadata.current$genotype)), 
+       text.col=pal4genotype, cex=0.7, bg="white")
+
+# Third PCA plot
+plotMDS(getM(mSet), top=1000, gene.selection="common", 
+        col=pal4genotype[factor(metadata.current$genotype)], dim=c(3,4))
+legend("topleft", legend=levels(factor(metadata.current$genotype)), 
+       text.col=pal4genotype, cex=0.7, bg="white")
+```
+
+### PCA
+```{r}
+# Perform PCA
+pca_results <- prcomp(t(beta_values_numeric), scale. = TRUE)  # transposing to have samples as rows
+
+# Get PCA results
+pca_data <- as.data.frame(pca_results$x)
+pca_data$sampleCode <- rownames(pca_data)
+
+# Merge PCA results with metadata for colouring
+pca_data <- merge(pca_data, metadata, by = "sampleCode")
+
+# Create a PCA plot
+p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = diffState, shape = genotype, label = sampleCode)) +
+  geom_point(size=3) +
+  geom_text(vjust = -1.5, size = 3, check_overlap = TRUE) +  # Add sampleCode labels
+  labs(title = "PCA of Methylation Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_color_manual(values = pal4cellType) +  # Use color palette defined earlier
+  guides(shape = guide_legend(title = "Cell Type"))
+
+# Print the PCA plot
+print(p)
+
+# Create a PCA plot
+p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = genotype, label = sampleCode)) +
+  geom_text(vjust = -1.5, size = 3, check_overlap = TRUE) +  # Add sampleCode labels
+  labs(title = "PCA of Methylation Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_color_manual(values = pal4genotype) +  
+  guides(shape = guide_legend(title = "Genotype")) 
+
+# Print the PCA plot
+print(p)
+
+custom_colors <- c("WT" = "#008cf9", 
+                   "SCN2A" = "#b80058", 
+                   "CHD2" = "#ebac23")  # Add or modify as necessary
+                   
+p3d <- plot_ly(pca_data, 
+                x = ~PC1, 
+                y = ~PC2, 
+                z = ~PC3, 
+                color = ~genotype,  # Reference the genotype for coloring
+                text = ~sampleCode,
+                colors = custom_colors,  # Use the custom color scale
+                mode = 'markers+text') %>%
+  layout(title = '3D PCA of Methylation Data',
+         scene = list(xaxis = list(title = 'Principal Component 1'),
+                      yaxis = list(title = 'Principal Component 2'),
+                      zaxis = list(title = 'Principal Component 3')),
+         legend = list(title = list(text = 'Genotype')),  # Update legend title if necessary
+         showlegend = TRUE)
+
+# Display the plot
+p3d # This line will render the plot in the R environment
+```
+
+
+## Design and Contrast Matricies
+```{r}
+diffVsGeno = factor(paste(metadata.current$diffState, metadata.current$genotype, sep="."))
+
+f <- factor(diffVsGeno, levels=levels(diffVsGeno))
+design = model.matrix(~0+f) # If there are other things to block we could add them here e.g. (~0+f+Age+Sex)
+colnames(design) <- levels(diffVsGeno)
+fit <- lmFit(m_values, design)
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(
+    fibroblast.WT-fibroblast.SCN2A,
+    fibroblast.WT-fibroblast.CHD2,
+    iN_day_10.WT-iN_day_10.SCN2A,
+    iN_day_10.WT-iN_day_10.CHD2, 
+    fibroblast.WT-iN_day_10.WT,
+    levels=design)# These are the only major hypotheses to test but you can explore more if you want e.g. fibroblast.SCN2A-fibroblast.CHD2, etc.
+
+fit2 <- contrasts.fit(fit, contMatrix)
+fit2 <- eBayes(fit2)
+
+summary(decideTests(fit2))
+```
+
+
+
+### Annotate all DMPs
+This code cycles through all contrasts to identify DMPs and then attaches annotations to each
+```{r}
+dmps <- summary(decideTests(fit2, p.value=0.05))
+rownames(dmps) <- c("Hyper", "NotSig", "Hypo")
+colnames(dmps) <- gsub(" - ","_", colnames(dmps))
+
+annEPICSub <- ann[match(rownames(beta_values),ann$Name), c(1:4,12:19,22:ncol(ann))]
+
+dmplist <- data.frame() # df to store the DMPs
+cg <- list() # list to store the names of significant probes
+
+contrasts <- colnames(contMatrix)
+cg <- vector("list", length(contrasts))  # Use a list to store row names
+
+for (i in 1:length(contrasts)) {  # for every comparison...
+  # Extract the significant DMPs and annotate
+  dmp <- topTable(fit2, num=Inf, coef=i, genelist=annEPICSub, p.value=0.05)
+  
+  # Check if dmp is not empty
+  if (nrow(dmp) > 0) {
+    dmp$Contrast <- contrasts[i]  # Add the Contrast column
+    dmplist <- rbind(dmplist, dmp)  # Bind the current dmp to the list
+    cg[[i]] <- row.names(dmp)  # Store the row names of the significant DMPs
+  } else {
+    message(paste("No significant DMPs for contrast:", contrasts[i]))
+    cg[[i]] <- character(0)  # Make sure cg has a value even when dmp is empty
+  }
+}
+
+kbl(dmplist) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+```
+### Cluster DMPs using a heatmap
+```{r DMP_heatmap}
+
+# Extract moderated t-statistic and p-values
+topTable <- topTable(fit2, adjust="fdr", sort.by="F", n=Inf)  
+significant_probes <- rownames(topTable)[topTable$adj.P.Val < 0.05]
+#significant_probes <- rownames(topTable)[topTable$P.Val < 0.0001]
+
+# Get the matrix for significant probes
+m_values_significant <- m_values[significant_probes,]
+
+# Plot heatmap
+library(pheatmap)
+library(pheatmap)
+pheatmap(m_values_significant, 
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         main = "Heatmap of Differentially Methylated Probes",
+         scale = "row",
+         color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(255))
+```
+
+### Volcano plots of DMPs
+```{r volcano_plots_for_DMPs}
+
+volcano_data <- data.frame(
+    logFC = fit2$coefficients,
+    negLogP = -log10(fit2$p.value),
+    probe = rownames(fit2)
+)
+
+# Check the structure of the new data frame
+print(str(volcano_data))
+print(head(volcano_data))
+
+# Now plot the volcano plot
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10(fit2[["p.value"]][,2]))
+dat$threshold <- as.factor(abs(dat$foldchange) < 0.4)
+
+#Visualization
+#ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+#  geom_point(aes(color=PValue<0.01)) +
+#  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+#theme_minimal()
+
+cols <- c("TRUE" = "grey", "FALSE" = xgfs_normal12[9])
+ggplot(data=dat, aes(x=foldchange, y = logPvalue, color=threshold)) +
+  geom_point(alpha=.6, size=1.2) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 0.4, colour=xgfs_normal12[2], linetype="dashed") + 
+  geom_vline(xintercept = - 0.4, colour=xgfs_normal12[2], linetype="dashed") +
+  theme(legend.position="none") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+Axes:
+ - X-Axis (Fold Change)**: This indicates the magnitude and direction of change in expression for each probe. Points to the right (positive values) indicate upregulation, while points to the left (negative values) indicate downregulation.
+ - Y-Axis (−log10 p-value)**: This represents the statistical significance of the change, with higher values indicating more statistically significant results. A higher point on this axis corresponds to a lower p-value.
+ 
+Colored Points:
+ - Blue Points: Represent probes that are considered significant based on the defined threshold of absolute fold change (> 0.4).
+ - Grey Points: Represent non-significant probes based on the same threshold.
+ 
+Interpretation:
+ - Probes that are located in the top corners (either top left or top right) are interesting candidates for further investigation because they show both significant changes and high statistical significance.
+ - Probes around the vertical dashed lines that do not extend high into the -log10 p-value (the lower part of the y-axis) may be of interest but do not meet statistical significance.
+
+### DMR Analysis using DMRcate
+
+```{r DMRcate_function}
+# Set up the analysis this takes a while to run
+contrast.df = data.frame("cont.names" = c("FB.SCN2A.DMR", "FB.CHD2.DMR", "iN_d10.SCN2A.DMR", 
+                                          "iN_d10.CHD2.DMR", "FB.iN_d10.WT.DMR"), 
+                         "coef" = contrasts)
+
+# Define this as a function the cycle through each contrast
+dmrcate_result_range = function(object, coef){
+  myannotation <- cpg.annotate("array", object=object, what = "M",
+                             arraytype = "EPICv2", epicv2Filter = "mean",
+                             epicv2Remap = TRUE, analysis.type="differential",
+                             design=design, contrasts = TRUE, cont.matrix = contMatrix,
+                             coef = coef, fdr=0.05)
+  
+  results <- dmrcate(myannotation, C = 2)
+  return(extractRanges(results, genome = "hg38"))
+}
+
+for (name in head(contrast.df$cont.names,1)){
+  assign(paste(name), dmrcate_result_range(m_values, contrast.df[contrast.df$cont.names==name, "coef"]))
+}
+```
+
+
+
+```{r make_DMR_plots}
+kbl(as.data.frame(results.ranges)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+```{r DMRcate_analysis_SCN2A_iN}
+# Set up the analysis this takes a while to run
+
+SCN2A.d10.anno <- cpg.annotate("array", object=m_values, what = "M",
+                             arraytype = "EPICv2", epicv2Filter = "mean",
+                             epicv2Remap = TRUE, analysis.type="differential",
+                             design=design, contrasts = TRUE, cont.matrix = contMatrix, 
+                             coef="iN_day_10.WT - iN_day_10.SCN2A", fdr=0.05)
+
+
+res.SCN2A.d10 <- dmrcate(SCN2A.d10.anno, C = 2)
+ranges.SCN2A.d10 <- extractRanges(results, genome = "hg38")
+
+```
+
+
+
+```{r make_DMR_plots}
+kbl(as.data.frame(ranges.SCN2A.d10)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+## Additional Visualization: Boxplots for Specific Probes
+```{r plot_probes_of_interest}
+# Select specific probes of interest for boxplots
+#probes_of_interest <- c("Probe1", "Probe2", "Probe3")  # Replace with actual probe names
+
+boxplot_data <- m_values[probes_of_interest,]
+boxplot_data <- as.data.frame(t(boxplot_data))
+
+boxplot_data$sampleCode <- rownames(boxplot_data)
+boxplot_data_melted <- melt(boxplot_data, id.vars = "sampleCode")
+
+ggplot(boxplot_data_melted, aes(x = variable, y = value, fill = sampleCode)) +
+    geom_boxplot() +
+    labs(title = "Boxplots for Selected Probes",
+         x = "Probes",
+         y = "M-values") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+probes_of_interest <- c("Probe1", "Probe2", "Probe3")
+available_probes <- rownames(m_values)
+
+# Get the intersection of available probes and probes_of_interest
+valid_probes <- intersect(probes_of_interest, available_probes)
+print(valid_probes)  # Print valid probes
+
+if (length(valid_probes) > 0) {
+    boxplot_data <- m_values[valid_probes, ]
+    boxplot_data <- as.data.frame(t(boxplot_data))
+    boxplot_data$sampleCode <- rownames(boxplot_data)
+    boxplot_data_melted <- melt(boxplot_data, id.vars = "sampleCode")
+
+    ggplot(boxplot_data_melted, aes(x = variable, y = value, fill = sampleCode)) +
+        geom_boxplot() +
+        labs(title = "Boxplots for Selected Probes",
+             x = "Probes",
+             y = "M-values") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+    message("No valid probes found in m_values.")
+}
+```
+
+
+```{r}
+# Prepare a data frame to store DMPs and their associated gene names
+dmp_with_genes <- data.frame()
+
+for (i in 1:length(contrasts)) {  # for every comparison...
+  # Extract the significant DMPs and annotate
+  dmp <- topTable(fit2, num=Inf, coef=i, genelist=annEPICSub, p.value=0.01)
+
+  # Check if dmp is not empty
+  if (nrow(dmp) > 0) {
+    dmp$Contrast <- contrasts[i]  # Add the Contrast column
+    dmplist <- rbind(dmplist, dmp)  # Bind the current dmp to the list
+    cg[[i]] <- row.names(dmp)  # Store the row names of the significant DMPs
+
+    # Extract gene names for significant probes using the annotation
+    significant_genes <- annEPICSub$UCSC_RefGene_Name[match(row.names(dmp), annEPICSub$Name)]
+    
+    # Create a temporary data frame for DMPs and corresponding genes
+    temp_dmp_with_genes <- data.frame(
+      Probe = row.names(dmp), 
+      Gene = significant_genes,
+      dmp,
+      stringsAsFactors = FALSE  # Avoid factors for text fields
+    )
+    
+    # Keep rows with valid gene names (not NA)
+    temp_dmp_with_genes <- temp_dmp_with_genes[!is.na(temp_dmp_with_genes$Gene), ]
+    
+    # Combine with the main data frame
+    dmp_with_genes <- rbind(dmp_with_genes, temp_dmp_with_genes)  
+  } else {
+    message(paste("No significant DMPs for contrast:", contrasts[i]))
+    cg[[i]] <- character(0)  # Ensure cg has a value even when dmp is empty
+  }
+}
+
+# Print out the DMPs with associated gene names
+head(dmp_with_genes) 
+```
+
+
+## Session Information
+This information documents the computing environment used to do this analysis to enable others to replicate these findings.
+```{r session_info}
+sessionInfo()
+```
+
+
+
+

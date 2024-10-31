@@ -1,0 +1,973 @@
+---
+title: "DEE fibroblast transdifferentiation RNAseq Transcripts Analysis"
+author: "Mark Corbett, Kiara Grasso"
+date: "22/10/2024"
+output:
+  html_document:
+      toc: true
+      code_folding: hide
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rgl)
+library(kableExtra)
+knitr::knit_hooks$set(webgl = hook_webgl)
+```
+
+## Introduction
+The following document is a summary of the analysis method of RNASeq data generated from transdifferentiated fibroblasts from individuals with DEE due to variants in CHD2 or SCN2A.  
+The samples consist of differeing numbers of biological replicates of each genotype (WT = 4, SCN2A =3 and CHD2 =2) extracted from cultured cells as fibroblasts then days 10, 22 and 28.
+Sample libraries were prepared for sequencing by the service provider (SAGC) using the ribosomal reduction, mRNA enrichment according to the maufacturers protocol (Nugen Universal Plus Total RNA-seq protocol (Part No. 15044223 Rev. B).).  Strand-specific sequencing was carried by SAGC in two batches on MGI-T7 and MGI-G400 platforms respectively using a 2 x 150 bp, paired end read strategy.
+Prior to differential gene expression analysis, RNAseq data were psuedo-mapped to the ENSEMBL v84 set of human transcripts using the Salmon pipeline refer to our [protocol document](https://docs.google.com/document/d/1TbvCCqPcnCx9Xl9MZPZgQquyuG6FG43shAobZbsFB8I/edit#heading=h.lwetuj3o1vx4) and [git repository](https://github.com/speleonut/RNASeq/tree/master/salmon.Illumina) for details.
+
+## Set up the environment
+This sets up paths to files, imports metadata associated with the samples and defines sample groups for the QC and statistical tests.  
+```{r setup_env}
+counts_dir = "/Users/kiaragrasso/Desktop/DEE_iNeurons/data/salmon"
+ExperimentName = "RNASeq.DEE.iNeuron.10.2024"
+pdataFile = "/Users/kiaragrasso/Desktop/DEE_iNeurons/data/metadata/pdata.csv"
+sampleList = "/Users/kiaragrasso/Desktop/DEE_iNeurons/data/metadata/sampleOrder.txt"
+EpilepsyGenes = "/Users/kiaragrasso/Desktop/DEE_iNeurons/data/reference/EpilepsyGenes_v2024-09.tsv"
+```
+### Load required libraries
+These are loaded up front so you know what the requirements are to run the script.
+
+```{r load_libraries, results='hide'}
+library(dplyr)
+library(reshape2)
+library(tximeta)
+library(SummarizedExperiment)
+library(edgeR)
+library(RColorBrewer)
+library(ggplot2)
+library(pheatmap)
+library(VennDiagram)
+library(rtracklayer)
+library(biomaRt)
+```
+
+### Import sample metadata.
+An independent file is set up pdata.csv which contains information about the samples; pdata is short for phenotypic data.  Generally the more information the better, e.g. cell type, differentiation state, batches, RIN scores, sex, species, etc.
+```{r import_pdata}
+pdata<-read.table(file=pdataFile, header=TRUE, sep=",", as.is = FALSE)
+rownames(pdata)<-pdata[,"sampleCode"] # set row names to sample names
+pdata.current<-pdata # sometimes you want to throw out a sample or use a subset.  designating pdata.current allows you to temporarily change this without altering your original pdata table
+samples<-as.character(pdata.current$sampleCode)
+quantFiles <- file.path(counts_dir, pdata.current$folder,"quant.sf")
+pdata.current <- data.frame(files = quantFiles, names = samples, pdata.current) # sets the format specifically required by tximeta
+kbl(pdata.current) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+```
+
+### Groups for statistical tests
+These are complex data with genotype and differentiation state to be considered. The script below sets up these variables for the series of comparisons to be made with these data.
+There are four differentiation states (fibroblast, day 10, day 22 and day 28) and three genotypes (SCN2A, CHD2 and WT).  There are several hypotheses that can be tested.
+1. Transdifferentiation of fibroblasts leads to expression of neuronal marker genes.
+2. WT, SCN2A and CHD2 genotypes confer differences in gene expression patterns at each diffrentiation time point.
+
+```{r define_tests}
+# Set up vectors of categories
+
+# Grouped categories
+diffState = factor(paste(pdata.current$diffState))
+genotype = factor(paste(pdata.current$genotype))
+diffVsGeno = factor(paste(pdata.current$diffState, pdata.current$genotype, sep="."))
+sex = factor(paste(pdata.current$sex))
+
+# Define colour palettes for graphing
+# I use the palettes suggested here https://tsitsul.in/blog/coloropt/ but there are many other options
+# e.g. https://medialab.github.io/iwanthue/ or https://www.simplifiedsciencepublishing.com/resources/best-color-palettes-for-scientific-figures-and-data-visualizations
+
+xgfs_normal12 = c("#ebac23", "#b80058", "#008cf9", "#006e00", "#00bbad", "#d163e6", "#b24502", "#ff9287", "#5954d6", "#00c6f8", "#878500", "#00a76c", "#bdbdbd")
+pal4cellType = xgfs_normal12[c(1:length(levels(diffState)))]
+pal4genotype = xgfs_normal12[c(1:length(levels(genotype)))]
+pal4diffVsGeno = xgfs_normal12[c(1:length(levels(diffVsGeno)))]
+pal4Sex = xgfs_normal12[c(6,9)] # It's sterotyped but it works
+blue_col_scale = brewer.pal(4,"Blues")
+pal4RIN = colorRampPalette(blue_col_scale)
+
+# Gene and Transcript Lists
+
+diffMarkerGenes = data.frame(ensembl_gene_id = c("ENSG00000111704",
+                    "ENSG00000204531",
+                    "ENSG00000181449",
+                    "ENSG00000007372",
+                    "ENSG00000163508",
+                    "ENSG00000170558",
+                    "ENSG00000132688",
+                    "ENSG00000148773",
+                    "ENSG00000077279",
+                    "ENSG00000258947"))
+
+
+# Custom sample order
+sampleOrder = read.table(sampleList)
+sampleOrder = as.vector(sampleOrder[,1])
+
+WTsamples = pdata.current$sampleCode[pdata.current$genotype == "WT"]
+SCN2Asamples = pdata.current$sampleCode[pdata.current$genotype == "SCN2A"]
+CHD2samples = pdata.current$sampleCode[pdata.current$genotype == "CHD2"]
+
+Epilepsy_gene_list = read.table(EpilepsyGenes, header = TRUE, sep = "\t")
+DEE_List = Epilepsy_gene_list$ensembl_gene_id[grep("DEE", Epilepsy_gene_list$Phenotype)] # column names of the original file https://github.com/bahlolab/Genes4Epilepsy/releases/tag/v2024_09 have been edited
+DEE_biobank_list = read.table("data/reference/EpilepsyBiobank.list.txt", col.names = "ensembl_gene_id")
+
+SCN2A_gene = "ENSG00000136531"
+SCN2A_transcripts = c("ENST00000375437", 
+"ENST00000636071",
+"ENST00000636985",
+"ENST00000631182",
+"ENST00000283256",
+"ENST00000637266") # GENCODE only
+
+CHD2_gene = "ENSG00000173575"
+CHD2_transcripts = c("ENST00000394196",
+"ENST00000626874",
+"ENST00000628375",
+"ENST00000625990",
+"ENST00000420239",
+"ENST00000626782",
+"ENST00000627622",
+"ENST00000629346") # GENCODE only
+
+```
+
+### Import counts data
+Counts data were generated using the *Salmon* pipeline. The individual *quant.sf* files contain counts and TPM data which will be extracted here and combined into transcript or gene counts.
+
+```{r import_counts}
+imported.counts <- tximeta(coldata = pdata.current)
+summarised.genes = summarizeToGene(imported.counts)
+```
+
+### Export counts for differential expression analysis
+The *counts.current* object is not strictly necessary but it can be helpful if subsetting counts into smaller groups or switching between summarised gene counts or transcript counts.
+```{r split_to_subfractions}
+gene.counts = assays(summarised.genes)[["counts"]]
+transcript.counts = assays(imported.counts)[["counts"]]
+counts.current<-gene.counts[,samples]
+```
+
+### Make a simple table of expression values
+These are normalized counts data and give an indication of the level of expression using the TPM units.  It's important to note that edgeR uses CPM to calculate differential expression so if you manually calculate fold changes from these data then you will likely not get the same result however the trend should be the same. 
+This short blog post goes through some of the differences in RNA-seq measures
+https://haroldpimentel.wordpress.com/2014/05/08/what-the-fpkm-a-review-rna-seq-expression-units/
+
+```{r make_a_counts_summary}
+gene.TPM <- assays(summarised.genes)[["abundance"]]
+transcript.TPM <- assays(imported.counts)[["abundance"]]
+current.TPM = gene.TPM
+```
+
+### Export counts table for unaffected individuals with annotations
+```{r export_wt_counts}
+selectSamples = WTsamples
+expressionMatrix = log(gene.TPM[ , selectSamples ], 2)
+ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+Annotations = getBM(attributes = c('hgnc_symbol','ensembl_gene_id','entrezgene_description'),
+                     filters = 'ensembl_gene_id',
+                     values = gsub("\\..*","",row.names(gene.TPM)),
+                     mart = ensembl)
+
+expressionMatrix = cbind(expressionMatrix, data.frame(ensembl_gene_id=gsub("\\..*","",row.names(expressionMatrix))))
+expressionMatrix = left_join(expressionMatrix, Annotations, by="ensembl_gene_id")
+expressionMatrix = distinct(expressionMatrix, ensembl_gene_id, .keep_all = TRUE)
+rownames(expressionMatrix)<-expressionMatrix$ensembl_gene_id
+write.table(expressionMatrix, file = "output/misc/WT_FB_to_day_28_iN.log2.TPM.txt", quote = FALSE, row.names=TRUE, col.names=TRUE, sep = "\t")
+
+```
+
+## QC
+### MDS Plot to file and show in the markdown
+The multidimensional scaling (MDS) plot shows the largest distance between samples based on the ranked largest fold changes in gene expression between each sample pair.  Only the first two factors are shown in the 2D plot. Each cell fraction has separated into a group in the graph with the nuclear and cytoplasmic samples showing some variation but overall these data look good.  All graphs are the same but the colours change to indicate different classes of covariates to help in their interpretation.
+```{r export_MDS_plot, echo=FALSE}
+outPath = "output/qc/MDSPlot"
+Test = "DataQC"
+d = DGEList(counts=counts.current, group=diffVsGeno)
+keep = filterByExpr(d)
+d = d[keep, , keep.lib.sizes=FALSE]
+d = calcNormFactors(d)
+
+png(filename=paste(outPath,ExperimentName,Test,"png", sep="."), height=980, width=980, bg="white")
+	par(cex=2.5, mar=c(4,4,1,1),pch=16)
+	plotMDS(d, labels=pdata.current$sampleCode, col = pal4diffVsGeno[factor(diffVsGeno)], main = "Colour by Major Groups")
+dev.off()
+```
+
+You can look through the following plots to explore the sources of variation
+```{r make_MDS_plots}
+plotMDS(d, labels=pdata.current$sampleCode, col = pal4diffVsGeno[factor(diffVsGeno)], main = "Colour by Major Groups")
+plotMDS(d, labels=pdata.current$sampleCode, col = pal4cellType[factor(diffState)], main = "Colour by Cell Type")
+plotMDS(d, labels=pdata.current$sampleCode, col = xgfs_normal12[c(1:length(levels(pdata.current$genotype)))][factor(pdata.current$genotype)], main = "Colour by Genotype")
+plotMDS(d, labels=pdata.current$sampleCode, col = xgfs_normal12[c(1:length(levels(pdata.current$batch)))][factor(pdata.current$batch)], main = "Colour by Batch")
+plotMDS(d, labels=pdata.current$sampleCode, col = pal4Sex[factor(pdata.current$sex)], main = "Colour by Sex")
+plotMDS(d, labels=pdata.current$sampleCode, col = pal4RIN(nrow(pdata.current))[findInterval(pdata$RIN, sort(c(0:10)))], main = "Colour by RIN") #[findInterval(pdata$RIN, sort(pdata.current$RIN))]
+
+```
+
+Note: CON3 (MC2936) sits apart from all other samples at all timepoints.
+
+### Plot library sizes
+Library size is taken into account by edgeR during the analysis so that counts are comparable for each gene or transcripts across all samples.  Note that edgeR does not perform any normalisation of counts data between genes or transcript (such as TPM or FPKM) because comparisons are only made per transcript or per gene their length is irrelevant.
+
+```{r plot_lib_sizes}
+#par(mar = c(7, 4, 2, 2) + 0.5)
+fudge = 7.5 # Hacky way of getting the x-axis labels positioned correctly in this plot you will need to adjust each time. Go down if the labels are longer than the graph and up if the graph is longer than the labels.
+barplot(d$samples$lib.size, 
+        xlab="Samples", 
+        ylab="Library Size", 
+        col = pal4genotype[factor(pdata.current$genotype)])
+text(seq(1, nrow(pdata.current) + fudge, by = (nrow(pdata.current) + fudge)/nrow(pdata.current)), 
+     par("usr")[3] - 0.25, 
+     cex=0.6, 
+     adj = 1.1, 
+     labels=pdata.current$sampleCode, 
+     xpd=TRUE, 
+     srt=45)
+```
+
+### 3D PCA plot
+Like the MDS plot, the principle components analysis plot is another way of looking at differences between the sample in bulk and exploring the sources of sample variation.  Unfortunately this won't render in the html, but you can see the table containing the PCA output below and some images that have been pasted in looking at each dimension.
+```{r 3D_PCA_plot}
+pc <- princomp(counts.current, cor=TRUE, scores=TRUE)
+summary(pc)
+
+plot3d(pc$loadings[,1:3], col=xgfs_normal12[c(1:length(levels(pdata.current$genotype)))][factor(pdata.current$genotype)], size=2)
+text3d(pc$loadings[,1:3], text=colnames(counts.current), col = xgfs_normal12[c(1:length(levels(pdata.current$genotype)))][factor(pdata.current$genotype)])
+
+```
+
+Note: The first 6 principle components comprise 99% of the variance.  The 3D PCA plot, separates different cell types from each other. 
+
+### PCA 1 vs 2
+
+![PCA plot dim 1 vs dim 2](output/qc/PCA1_2.RNASeq.DEE.iNeuron.10.2024.DataQC.png)
+
+### PCA 1 vs 3
+![PCA plot dim 1 vs dim 3](output/qc/PCA1_3.RNASeq.DEE.iNeuron.10.2024.DataQC.png)
+
+### PCA 2 vs 3
+
+![PCA plot dim 2 vs dim 3](output/qc/PCA2_3.RNASeq.DEE.iNeuron.10.2024.DataQC.png)
+
+Note: There are no samples to exclude on the basis of the QC analysis above. Here, we filter out anything which isn't an annotated gene so that we can interpret the analysis. We also reset any groups that might have changed if samples need to be removed from the analysis
+
+## Run a preliminary analysis to check data normalisation
+This part of the scripts applies normalisation to account for library size and removes genes that have low or no expression spanning over multiple experimental groups (we don't want to throw out a transcript which is not expressed in just one group as that could be very important). Low abundance transcripts in RNA-seq data are prone to high variation and will often "pollute" the final list of differentially expressed genes due to small variations in read counts per sample that result in apparently high fold changes (e.g. CPM=1 vs CPM=2 is a twofold change but CPM=101 vs CPM=102 is the same change in read count but not a large fold change).  edgeR has ways of compressing fold changes when the overall counts are low to help deal with this.  We then make some plots to look at the shape of the data to check it fits the typical model expected for RNAseq data.
+
+```{r filter_and_estimate_dispersion}
+d = DGEList(counts=counts.current, group=diffVsGeno)
+keep = filterByExpr(d)
+d = d[keep, , keep.lib.sizes=FALSE]
+d = calcNormFactors(d)
+f <- factor(diffVsGeno, levels=levels(diffVsGeno))
+design = model.matrix(~0+f)
+rownames(design) <- colnames(d)
+d = estimateDisp(d, design, robust = TRUE)
+```
+
+### Mean Variance, BCV and QL plots
+The Mean Variance plot shows the pooled variance of the counts from each sample, divided by a scaling factor calculated above (mostly this is library size). The black line indicates a standard Poisson distribution (it is usual for all other data points on the plot to be above this line) and the blue line indicates the prediction for a negative binomial model (we expect our data to lie close to this line). The blue dots are the average gene-level variance (the grey dots are the original values). The red "X" are the common dispersions of transcripts (averaged for transcripts within the bin it represents).  Overall these data look good and follow the negative binomial model reasonably closely.
+
+The biological coefficient of variation (BCV) plot shows the differences in variation per gene compared to average gene expression (standard deviation / average expression).  You can see that genes with low expression have higher variation.
+
+The Quasi-Likelihood dispersion plot shows the transformation of read count data (black to red) after applying normalisation.
+
+These plots support that these data are of good quality and will be good to perform differential gene expression (or differential export) analyses.
+
+```{r, echo=FALSE}
+png(filename=paste("output/qc/MeanVarPlot",ExperimentName,Test,"png", sep="."), height=980, width=980, bg="white")
+	plotMeanVar(d, show.tagwise.vars=TRUE, NBline=TRUE)
+dev.off()
+png(filename=paste("output/qc/BCVPlot",ExperimentName,Test,"png", sep="."), height=980, width=980, bg="white")
+	plotBCV(d)
+dev.off()
+fit <- glmQLFit(d, design, robust=TRUE)
+png(filename=paste("output/qc/QLDPlot",ExperimentName,Test,"png", sep="."), height=980, width=980, bg="white")
+	plotQLDisp(fit)
+dev.off()
+```
+
+```{r plot_edgeR_QC}
+plotMeanVar(d, show.tagwise.vars=TRUE, show.raw.vars = TRUE, NBline=TRUE)
+plotBCV(d)
+plotQLDisp(fit)
+```
+
+### Check expression of target genes
+Plot out the expression of the target genes in each time point to check their expression levels.
+```{r check_target_genes}
+current.gene = SCN2A_gene
+gene_data = cbind(pdata.current[ , c("sampleCode", "genotype", "timepoint")], current.TPM[current.gene,])
+colnames(gene_data) <- c("sampleCode", "genotype", "timepoint", "SCN2A")
+gene_data = mutate(gene_data, genotype.timepoint = paste(genotype, timepoint, sep="."))
+gene_data$genotype.timepoint = factor(gene_data$genotype.timepoint)
+
+
+#png(filename=paste("output/qc/TPM",current.gene,ExperimentName,Test,"png", sep="."), height=980, width=980, bg="white")
+ggplot(data = gene_data, aes( x = genotype.timepoint, y = SCN2A, colour = factor(genotype))) +
+  geom_boxplot(lwd = 1, outlier.shape = NA) +
+  scale_color_manual(values = pal4genotype) + #[factor(pdata.current$genotype)]) +  
+  geom_jitter(color = "grey") +
+  xlab("Genotype at developmental timepoint") +
+  ylab(paste("TPM SCN2A (", current.gene, ")", sep ="")) +
+  labs(color="Genotype") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+#dev.off()
+
+current.gene = CHD2_gene
+gene_data = cbind(pdata.current[ , c("sampleCode", "genotype", "timepoint")], current.TPM[current.gene,])
+colnames(gene_data) <- c("sampleCode", "genotype", "timepoint", "CHD2")
+gene_data = mutate(gene_data, genotype.timepoint = paste(genotype, timepoint, sep="."))
+gene_data$genotype.diffState = factor(gene_data$genotype.timepoint)
+
+
+#png(filename=paste("output/qc/TPM",current.gene,ExperimentName,Test,"png", sep="."), height=980, width=980, bg="white")
+ggplot(data = gene_data, aes( x = genotype.timepoint, y = CHD2, colour = factor(genotype))) +
+  geom_boxplot(lwd = 1, outlier.shape = NA) +
+  scale_color_manual(values = pal4genotype) + #[factor(pdata.current$genotype)]) +  
+  geom_jitter(color = "grey") +
+  xlab("Genotype at developmental timepoint") +
+  ylab(paste("TPM CHD2 (", current.gene, ")", sep ="")) +
+  labs(color="Genotype") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+#dev.off()
+
+```
+
+Note: Expression of both genes is variable in different samples and biological replicates. SCN2A expression is very low and moderately increases on average in WT and SCN2A cell lines.  CHD2 expression is relatively high and dips at day 10 and 22 compared to fibroblast and day 28 iNeurons.
+
+## Data Analysis
+### Hypotheses to test
+In all cases, each cell type will be tested separately except in the final cross comparisons where we will factor in differentiation over time and identify genes that change at different rates.
+
+### Hypothesis 1: Transdifferentiation of fibroblasts leads to expression of neuronal marker genes.
+We'll start by looking at the differentiation state of these cell lines relative to some typical marker genes. The first heatmap does not log2 transform the TPMs and also clusters the cell lines.  In the second heatmap TPMs are log2 transformed and the ordering is the same as it appears in the pdata table.  To avoid any errors during plotting a very small increment (0.0001) is added to all TPMs prior to log2 transformation.
+```{r plot_diff_state_with_markers}
+expressionMatrix = gene.TPM[ match(diffMarkerGenes$ensembl_gene_id,row.names(gene.TPM)), ]
+ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+Annotations = getBM(attributes = c('hgnc_symbol','ensembl_gene_id'),
+                     filters = 'ensembl_gene_id',
+                     values = diffMarkerGenes$ensembl_gene_id,
+                     mart = ensembl)
+Annotations = left_join(diffMarkerGenes, Annotations, by="ensembl_gene_id")
+row.names(expressionMatrix) <- Annotations$hgnc_symbol
+```
+
+```{r just_the_heatmaps}
+
+pheatmap(log2(expressionMatrix + 0.0001), color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu"))) (100), 
+                   angle_col = 90, cluster_cols = TRUE, cluster_rows = TRUE,
+                   main = "Expression (log2 TPM)")
+
+pheatmap(log2(expressionMatrix + 0.0001), color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu"))) (100), 
+                   angle_col = 90, cluster_cols = FALSE, cluster_rows = FALSE,
+                   main = "Expression (log2 TPM)")
+
+write.table(expressionMatrix, file = "output/misc/differentiation.markers.txt", quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+```
+
+Note: Fibroblast lines cluster together while neurons do not necessarily cluster by differentiation state.
+
+### Set up functions for testing differential expression
+The following functions save us some typing later on and ensures that the tests we run are consistent between different differentiation time points.
+
+```{r set_functions_for_DEG}
+# Define some functions so that code can be reused
+
+# This function tests a subset of genotypes at a particular state of differentiation.  It subsets pdata, fits the statistical generalised linear model to perform differential expression and return the results.
+test_a_diff_state = function(diffState, countTable) {
+  pdata.current = pdata[pdata$diffState %in% diffState,]
+  samples = as.character(pdata.current$sampleCode)
+  counts.current = countTable[,samples]
+  d = DGEList(counts=counts.current, group=pdata.current$genotype)
+  f <- factor(pdata.current$genotype, levels=c("WT","SCN2A","CHD2")) # This sets the levels in the exact order we want
+  design = model.matrix(~f)
+  rownames(design) <- colnames(d)
+  keep = filterByExpr(d, design)
+  d = d[keep,]
+  d = calcNormFactors(d)
+  d = estimateDisp(d, design, robust = TRUE)
+  return(glmQLFit(d, design))
+}
+
+# This function generates a text table that summarises how many genes are differentially expressed at different levels of differentiation.
+sig.gene.summary = function(x) {
+  sgs = cbind(summary(decideTests(x, p=0.005)),
+              summary(decideTests(x, p=0.01)),
+              summary(decideTests(x, p=0.05)),
+              summary(decideTests(x, p=0.2)),
+              summary(decideTests(x, adjust.method="none", p=0.01)))
+  colnames(sgs)<-c("q0.005", "q0.01", "q0.05", "q0.2", "p0.01")
+  return(sgs)
+}
+
+# ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+
+# This function adds gene annotations to a table of genes filterd by False Discovery Rate
+attach_annotations_by_FDR = function(x, FDR) {
+  pValCut = sum(p.adjust(x$table$PValue,method="BH") < FDR)
+  tagsToAnnotate = topTags(x, n=pValCut)
+  betterAnno = getBM(attributes = c('hgnc_symbol','entrezgene_description', 'chromosome_name', 'start_position', 'end_position', 'gene_biotype','hgnc_id','ensembl_gene_id'),
+                     filters = 'ensembl_gene_id',
+                     values = gsub("\\..*","",row.names(tagsToAnnotate)),
+                     mart = ensembl)
+
+  dexg = cbind(tagsToAnnotate, data.frame(ensembl_gene_id=gsub("\\..*","",row.names(tagsToAnnotate))))
+  dexg = left_join(dexg, betterAnno, by="ensembl_gene_id")
+  dexg = distinct(dexg, ensembl_gene_id, .keep_all = TRUE)
+  rownames(dexg)=rownames(tagsToAnnotate)
+  if (is(x, "DGELRT")){
+    tpm.dexg = current.TPM[rownames(dexg), rownames(x$samples)]
+    tpm.summary = t(aggregate(t(tpm.dexg), list(x$samples$group), mean))
+    colnames(tpm.summary) = tpm.summary[1,]
+    tpm.summary = apply(tpm.summary[-1,],2,as.numeric)
+    rownames(tpm.summary) = rownames(tpm.dexg)
+    tpm.dexg = log2(cbind(tpm.dexg + 0.0001, tpm.summary + 0.0001))
+    dexg = cbind(dexg, tpm.dexg)
+  }
+  return(dexg)
+}
+
+# As above but filtering by p value
+attach_annotations_by_p = function(x, pVal) {
+  pValCut = sum(x$table$PValue < pVal)
+  tagsToAnnotate = topTags(x, n=pValCut)
+  betterAnno = getBM(attributes = c('hgnc_symbol','entrezgene_description', 'chromosome_name', 'start_position', 'end_position', 'gene_biotype','hgnc_id','ensembl_gene_id'),
+                     filters = 'ensembl_gene_id',
+                     values = gsub("\\..*","",row.names(tagsToAnnotate)),
+                     mart = ensembl)
+
+  dexg = cbind(tagsToAnnotate, data.frame(ensembl_gene_id=gsub("\\..*","",row.names(tagsToAnnotate))))
+  dexg = left_join(dexg, betterAnno, by="ensembl_gene_id")
+  dexg = distinct(dexg, ensembl_gene_id, .keep_all = TRUE)
+  rownames(dexg)=rownames(tagsToAnnotate)
+  if (is(x, "DGELRT")){
+    tpm.dexg = current.TPM[rownames(dexg), rownames(x$samples)]
+    tpm.summary = t(aggregate(t(tpm.dexg), list(x$samples$group), mean))
+    colnames(tpm.summary) = tpm.summary[1,]
+    tpm.summary = apply(tpm.summary[-1,],2,as.numeric)
+    rownames(tpm.summary) = rownames(tpm.dexg)
+    tpm.dexg = log2(cbind(tpm.dexg + 0.0001, tpm.summary + 0.0001))
+    dexg = cbind(dexg, tpm.dexg)
+  }
+  return(dexg)
+}
+
+# This function tests the significance of gene list overlaps.  To use it you need to know the length of the lists you are checking and the background list of genes expressed at the time point/s of interest.
+hypergeometric_test_of_lists = function(total_genes, longest_list, shortest_list) {
+  n = length(unique(total_genes))
+  a = length(longest_list)
+  b = length(shortest_list)
+  t = length(intersect(longest_list, shortest_list))
+  PValue = sum(dhyper(t:b, a, n - a, b))
+  df = data.frame("total.genes" = n, "list.1" = a, "list.2" = b, "intersection" = t, "PValue" = PValue)
+  return(df)
+}
+
+```
+
+### Hypothesis 2: WT, SCN2A and CHD2 genotypes confer differences in gene expression patterns at each diffrentiation time point.
+In the following tables: logFC is the log2 transformed fold change between the test groups and the control group.  logCPM is the average log2 transformed CPM value for all samples, values less than 0 usually indicate a gene with low expression however it is important to remember that this value is not normalised to gene length so a shorter transcript naturally has less reads mapped than a longer transcript with an equivalent level of expression. PValue is self explanatory, FDR is the adjusted p-value "False Discovery Rate". In the summary of numbers of differentially expressed genes, FDR is represented by "q" while raw p-values are represented by "p".
+
+### 1a. Fibroblasts
+Test the differences between WT, SCN2A and CHD2 at the Fibroblast stage.
+
+```{r test_FB}
+fit = test_a_diff_state(diffState = "fibroblast", countTable = counts.current)
+qlf = glmQLFTest(fit, coef=2:3)
+sig.gene.summary(qlf)
+FB.genes.expressed = rownames(qlf$table)
+attach_annotations_by_p(qlf, 0.01) %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+We can also make each comparison individually
+
+```{r FB_SCN2A}
+outPath = "output/fibroblast/DEG"
+Test = "FB.SCN2A.vs.WT"
+qlf = glmQLFTest(fit, coef=2)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("SCN2A", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+SCN2AUp = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+SCN2ADown = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+
+
+
+```
+```{r FB_CHD2}
+Test = "FB.CHD2.vs.WT"
+qlf = glmQLFTest(fit, coef=3)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("CHD2", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+CHD2Up = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+CHD2Down = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r FB_Venn}
+Test = "FB"
+venn.diagram(list(CHD2 = CHD2Up, SCN2A = SCN2AUp), filename = paste(outPath,ExperimentName,Test,"up.png", sep="."), imagetype = "png", main = paste(Test, "up regulated", sep = " "), col = xgfs_normal12[1:2])
+venn.diagram(list(CHD2 = CHD2Down, SCN2A = SCN2ADown), filename = paste(outPath,ExperimentName,Test,"down.png", sep="."), imagetype = "png", main = paste(Test, "down regulated", sep = " "), col = xgfs_normal12[1:2])
+
+SCN2AUp.FB = SCN2AUp
+SCN2ADown.FB = SCN2ADown
+CHD2Up.FB = CHD2Up
+CHD2Down.FB = CHD2Down
+```
+
+![Venn diagram up regulated](output/fibroblast/DEG.RNASeq.DEE.iNeuron.10.2024.FB.up.png)
+
+![Venn diagram down regulated](output/fibroblast/DEG.RNASeq.DEE.iNeuron.10.2024.FB.down.png)
+
+Note:
+
+### 1b. Day 10
+Test the differences between WT, SCN2A and CHD2 at day 10 of transdifferentiation
+```{r test_day_10}
+fit = test_a_diff_state(diffState = "day_10", countTable = counts.current)
+qlf = glmQLFTest(fit, coef=2:3)
+sig.gene.summary(qlf)
+d10.genes.expressed = rownames(qlf$table)
+attach_annotations_by_p(qlf, 0.01) %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+```{r day10_SCN2A}
+outPath = "output/day10/DEG"
+Test = "day10.SCN2A.vs.WT"
+qlf = glmQLFTest(fit, coef=2)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("SCN2A", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+SCN2AUp = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+SCN2ADown = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r day10_CHD2}
+Test = "day10.CHD2.vs.WT"
+qlf = glmQLFTest(fit, coef=3)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("CHD2", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+CHD2Up = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+CHD2Down = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r day10_Venn}
+Test = "day10"
+venn.diagram(list(CHD2 = CHD2Up, SCN2A = SCN2AUp), filename = paste(outPath,ExperimentName,Test,"up.png", sep="."), imagetype = "png", main = paste(Test, "up regulated", sep = " "), col = xgfs_normal12[1:2])
+venn.diagram(list(CHD2 = CHD2Down, SCN2A = SCN2ADown), filename = paste(outPath,ExperimentName,Test,"down.png", sep="."), imagetype = "png", main = paste(Test, "down regulated", sep = " "), col = xgfs_normal12[1:2])
+
+SCN2AUp.d10 = SCN2AUp
+SCN2ADown.d10 = SCN2ADown
+CHD2Up.d10 = CHD2Up
+CHD2Down.d10 = CHD2Down
+
+```
+
+![Venn diagram up regulated](output/day10/DEG.RNASeq.DEE.iNeuron.10.2024.day10.up.png)
+
+![Venn diagram down regulated](output/day10/DEG.RNASeq.DEE.iNeuron.10.2024.day10.down.png)
+
+Note:
+
+### 1c. Day 22 of transdifferentiation
+Test the differences between WT, SCN2A and CHD2 at 22 days of transdifferentiation.
+```{r test_day22}
+fit = test_a_diff_state(diffState = "day_22", countTable = counts.current)
+qlf = glmQLFTest(fit, coef=2:3)
+sig.gene.summary(qlf)
+d22.genes.expressed = rownames(qlf$table)
+attach_annotations_by_p(qlf, 0.01) %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+```{r day22_SCN2A}
+outPath = "output/day22/DEG"
+Test = "day22.SCN2A.vs.WT"
+qlf = glmQLFTest(fit, coef=2)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("SCN2A", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+SCN2AUp = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+SCN2ADown = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r day22_CHD2}
+Test = "day22.CHD2.vs.WT"
+qlf = glmQLFTest(fit, coef=3)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("CHD2", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+CHD2Up = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+CHD2Down = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r day22_Venn}
+Test = "day22"
+venn.diagram(list(CHD2 = CHD2Up, SCN2A = SCN2AUp), filename = paste(outPath,ExperimentName,Test,"up.png", sep="."), imagetype = "png", main = paste(Test, "up regulated", sep = " "), col = xgfs_normal12[1:2])
+venn.diagram(list(CHD2 = CHD2Down, SCN2A = SCN2ADown), filename = paste(outPath,ExperimentName,Test,"down.png", sep="."), imagetype = "png", main = paste(Test, "down regulated", sep = " "), col = xgfs_normal12[1:2])
+
+SCN2AUp.d22 = SCN2AUp
+SCN2ADown.d22 = SCN2ADown
+CHD2Up.d22 = CHD2Up
+CHD2Down.d22 = CHD2Down
+
+```
+
+![Venn diagram up regulated](output/day22/DEG.RNASeq.DEE.iNeuron.10.2024.day22.up.png)
+
+![Venn diagram down regulated](output/day22/DEG.RNASeq.DEE.iNeuron.10.2024.day22.down.png)
+
+Note:
+
+### 1d. Day 28 of transdifferentiation
+Test the differences between WT, SCN2A and CHD2 at 28 days of transdifferentiation.
+```{r test_day28}
+fit = test_a_diff_state(diffState = "day_28", countTable = counts.current)
+qlf = glmQLFTest(fit, coef=2:3)
+sig.gene.summary(qlf)
+d28.genes.expressed = rownames(qlf$table)
+attach_annotations_by_p(qlf, 0.01) %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+```{r day28_SCN2A}
+outPath = "output/day28/DEG"
+Test = "day28.SCN2A.vs.WT"
+qlf = glmQLFTest(fit, coef=2)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("SCN2A", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+SCN2AUp = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+SCN2ADown = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r day28_CHD2}
+Test = "day28.CHD2.vs.WT"
+qlf = glmQLFTest(fit, coef=3)
+sig.gene.summary(qlf)
+deg = attach_annotations_by_p(qlf, 0.01)
+maxAveTPM = data.frame(maxAveTPM = apply(deg[,c("CHD2", "WT")], 1, max))
+deg = cbind(deg, maxAveTPM)
+# deg %>%
+#   kbl() %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+#   scroll_box(width = "100%", height = "300px")
+
+write.table(deg, file=paste(outPath,ExperimentName,Test,"txt", sep="."), quote=FALSE, row.names=TRUE, col.names=TRUE, sep="\t")
+
+#MvsA plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logCPM, y=logFC)) +
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+#Volcano plot
+ggplot(data = as.data.frame(topTags(qlf, n=NULL)) %>% arrange(desc(PValue)), aes(x=logFC, y=-log10(PValue))) + 
+  geom_point(aes(color=PValue<0.01)) +
+  scale_color_manual(values = xgfs_normal12[c(13,2)]) +
+  theme_minimal()
+
+CHD2Up = row.names(deg[deg[,"logFC"] > 0 & deg[,"maxAveTPM"] > log2(0.1),])
+CHD2Down = row.names(deg[deg[,"logFC"] < 0 & deg[,"maxAveTPM"] > log2(0.1),])
+```
+```{r day28_Venn}
+Test = "day28"
+venn.diagram(list(CHD2 = CHD2Up, SCN2A = SCN2AUp), filename = paste(outPath,ExperimentName,Test,"up.png", sep="."), imagetype = "png", main = paste(Test, "up regulated", sep = " "), col = xgfs_normal12[1:2])
+venn.diagram(list(CHD2 = CHD2Down, SCN2A = SCN2ADown), filename = paste(outPath,ExperimentName,Test,"down.png", sep="."), imagetype = "png", main = paste(Test, "down regulated", sep = " "), col = xgfs_normal12[1:2])
+
+SCN2AUp.d28 = SCN2AUp
+SCN2ADown.d28 = SCN2ADown
+CHD2Up.d28 = CHD2Up
+CHD2Down.d28 = CHD2Down
+
+```
+
+![Venn diagram up regulated](output/day28/DEG.RNASeq.DEE.iNeuron.10.2024.day28.up.png)
+
+![Venn diagram down regulated](output/day28/DEG.RNASeq.DEE.iNeuron.10.2024.day28.down.png)
+
+Note:
+
+### Compare between time points
+Take the DEGs from each timepoint and examine the overlaps
+```{r Venns_between_timepoints}
+outPath = "output/misc/DEG"
+Test = "SCN2A"
+venn.diagram(list( 
+  FB = c(SCN2AUp.FB, SCN2ADown.FB), 
+  day_10 = c(SCN2AUp.d10, SCN2ADown.d10), 
+  day_22 = c(SCN2AUp.d22, SCN2ADown.d22), 
+  day_28 = c(SCN2AUp.d28, SCN2ADown.d28)), 
+  filename = paste(outPath,ExperimentName,Test,"png", sep="."), 
+  imagetype = "png", main = paste(Test, "DEGs per differentiation stage", sep = " "), 
+  col = xgfs_normal12[c(4,6,7,9)])
+
+Test = "CHD2"
+venn.diagram(list( 
+  FB = c(CHD2Up.FB, CHD2Down.FB), 
+  day_10 = c(CHD2Up.d10, CHD2Down.d10), 
+  day_22 = c(CHD2Up.d22, CHD2Down.d22), 
+  day_28 = c(CHD2Up.d28, CHD2Down.d28)), 
+  filename = paste(outPath,ExperimentName,Test,"png", sep="."), 
+  imagetype = "png", main = paste(Test, "DEGs per differentiation stage", sep = " "), 
+  col = xgfs_normal12[c(4,6,7,9)])
+
+# Stats
+hypergeometric.tests = rbind(
+  SCN2A.FBvd10 = hypergeometric_test_of_lists(union(FB.genes.expressed,d10.genes.expressed),c(SCN2AUp.FB, SCN2ADown.FB),c(SCN2AUp.d10, SCN2ADown.d10)),
+  SCN2A.FBvd22 = hypergeometric_test_of_lists(union(FB.genes.expressed,d22.genes.expressed),c(SCN2AUp.FB, SCN2ADown.FB),c(SCN2AUp.d22, SCN2ADown.d22)),
+  SCN2A.FBvd28 = hypergeometric_test_of_lists(union(FB.genes.expressed,d28.genes.expressed),c(SCN2AUp.d28, SCN2ADown.d28),c(SCN2AUp.FB, SCN2ADown.FB)),
+  SCN2A.d10vd22 = hypergeometric_test_of_lists(union(d22.genes.expressed,d10.genes.expressed),c(SCN2AUp.d22, SCN2ADown.d22),c(SCN2AUp.d10, SCN2ADown.d10)),
+  SCN2A.d10vd28 = hypergeometric_test_of_lists(union(d28.genes.expressed,d10.genes.expressed),c(SCN2AUp.d28, SCN2ADown.d28),c(SCN2AUp.d10, SCN2ADown.d10)),
+  SCN2A.d22vd28 = hypergeometric_test_of_lists(union(d28.genes.expressed,d22.genes.expressed),c(SCN2AUp.d28, SCN2ADown.d28),c(SCN2AUp.d22, SCN2ADown.d22)), 
+  CHD2.FBvd10 = hypergeometric_test_of_lists(union(FB.genes.expressed,d10.genes.expressed),c(CHD2Up.FB, CHD2Down.FB),c(CHD2Up.d10, CHD2Down.d10)),
+  CHD2.FBvd22 = hypergeometric_test_of_lists(union(FB.genes.expressed,d22.genes.expressed),c(CHD2Up.FB, CHD2Down.FB),c(CHD2Up.d22, CHD2Down.d22)),
+  CHD2.FBvd28 = hypergeometric_test_of_lists(union(FB.genes.expressed,d28.genes.expressed),c(CHD2Up.d28, CHD2Down.d28),c(CHD2Up.FB, CHD2Down.FB)),
+  CHD2.d10vd22 = hypergeometric_test_of_lists(union(d22.genes.expressed,d10.genes.expressed),c(CHD2Up.d22, CHD2Down.d22),c(CHD2Up.d10, CHD2Down.d10)),
+  CHD2.d10vd28 = hypergeometric_test_of_lists(union(d28.genes.expressed,d10.genes.expressed),c(CHD2Up.d28, CHD2Down.d28),c(CHD2Up.d10, CHD2Down.d10)),
+  CHD2.d22vd28 = hypergeometric_test_of_lists(union(d28.genes.expressed,d22.genes.expressed),c(CHD2Up.d28, CHD2Down.d28),c(CHD2Up.d22, CHD2Down.d22)))
+
+hypergeometric.tests %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+![Venn diagram SCN2A](output/misc/DEG.RNASeq.DEE.iNeuron.10.2024.SCN2A.png)
+![Venn diagram CHD2](output/misc/DEG.RNASeq.DEE.iNeuron.10.2024.CHD2.png)
+
+Note: The low numbers of genes showing consistent differential expression between iNeuron time points is of potential concern.  In the day
+
+## Heatmaps for genesets
+### DEE genes
+Generate heat map for wild-type genotype cell lines based on the Genes4Epilepsy list
+```{r make_DEE_heatmaps}
+DEEMatrix = gene.TPM[ match(DEE_List,row.names(gene.TPM)) , colnames(gene.TPM) %in% WTsamples]
+#ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+Annotations = getBM(attributes = c('hgnc_symbol','ensembl_gene_id'),
+                     filters = 'ensembl_gene_id',
+                     values = DEE_List,
+                     mart = ensembl)
+Annotations = left_join(data.frame(ensembl_gene_id = DEE_List), Annotations, by="ensembl_gene_id")
+row.names(DEEMatrix) <- Annotations$hgnc_symbol
+
+pheatmap(log2(DEEMatrix + 0.0001), color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu"))) (100), 
+                   angle_col = 90, cluster_cols = TRUE, cluster_rows = FALSE,
+                   main = "Expression (log2 TPM)")
+
+png(filename=paste("output/misc/DEE",ExperimentName,"heatmap","png", sep="."), height=9130, width=980, bg="white")
+    pheatmap(log2(DEEMatrix + 0.0001), color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu"))) (100), 
+                   angle_col = 90, cluster_cols = TRUE, cluster_rows = FALSE,
+                   main = "Expression (log2 TPM)")
+dev.off()
+```
+
+```{r make_DEE_biobank_heatmap}
+DEEMatrix = gene.TPM[ match(DEE_biobank_list$ensembl_gene_id,row.names(gene.TPM)), colnames(gene.TPM) %in% WTsamples]
+ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+Annotations = getBM(attributes = c('hgnc_symbol','ensembl_gene_id'),
+                     filters = 'ensembl_gene_id',
+                     values = DEE_biobank_list$ensembl_gene_id,
+                     mart = ensembl)
+Annotations = left_join(DEE_biobank_list, Annotations, by="ensembl_gene_id")
+row.names(DEEMatrix) <- Annotations$hgnc_symbol
+
+pheatmap(log2(DEEMatrix + 0.0001), color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu"))) (100), 
+                   angle_col = 90, cluster_cols = TRUE, cluster_rows = FALSE,
+                   main = "Expression (log2 TPM)")
+
+png(filename=paste("output/misc/DEE_biobank",ExperimentName,"heatmap","png", sep="."), height=1500, width=980, bg="white")
+    pheatmap(log2(DEEMatrix + 0.0001), color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu"))) (100), 
+                   angle_col = 90, cluster_cols = TRUE, cluster_rows = TRUE,
+                   main = "Expression (log2 TPM)", fontsize = 16)
+dev.off()
+
+```
+
+## References
+### Mapping and counts data
+Patro R, Duggal G, Love MI, Irizarry RA, Kingsford C. Salmon: fast and bias-aware quantification of transcript expression using dual-phase inference. Nat Methods. 2017 Apr;14(4):417–9.
+
+Love MI, Soneson C, Hickey PF, Johnson LK, Pierce NT, Shepherd L, Morgan M, Patro R. Tximeta: Reference sequence checksums for provenance identification in RNA-seq PLOS Computational Biology 16(2): e1007664
+
+### Differential gene expression
+McCarthy DJ, Chen Y, Smyth GK. Differential expression analysis of multifactor RNA-Seq experiments with respect to biological variation. Nucleic Acids Res. 2012 May;40(10):4288–97. 
+
+### Gene annotations
+Durinck S, Spellman PT, Birney E, Huber W. Mapping identifiers for the integration of genomic datasets with the R/Bioconductor package biomaRt. , Nature Protocols 4, 1184-1191 (2009).
+
+Durinck S, Moreau Y, Kasprzyk A, Davis S, De Moor , Brazma A, Huber W. BioMart and Bioconductor: a powerful link between biological databases and microarray data analysis. Bioinformatics 21, 3439-3440 (2005).
+
+### Gene Ontology
+Raudvere, U., CHD2lberg, L., Kuzmin, I., Arak, T., Adler, P., Peterson, H. and Vilo, J., 2019. g: Profiler: a web server for functional enrichment analysis and conversions of gene lists (2019 update). Nucleic Acids Research, 47(W1), pp.W191-W198
+
+Supek F, Bošnjak M, Škunca N, Šmuc T. REVIGO Summarizes and Visualizes Long Lists of Gene Ontology Terms. PLOS ONE. 2011 Jul 18;6(7):e21800. 
+
+### Differential transcript and exon usage
+Love MI, Soneson C and Patro R. Swimming downstream: statistical analysis of differential transcript usage following Salmon quantification [version 3; peer review: 3 approved]. F1000Research 2018, 7:952
+
+Anders S, Reyes A, Huber W. Detecting differential usage of exons from RNA-seq data. Genome Res. 2012 Oct 1;22(10):2008–17. 
+
+
+## Session Information
+This information documents the computing environment used to do this analysis to enable others to replicate these findings.
+```{r session_info}
+sessionInfo()
+```
